@@ -7,6 +7,7 @@ package batch_test
 import (
 	"github.com/jfcote87/google-api-go-client/batch"
 	"github.com/jfcote87/google-api-go-client/batch/credentials"
+	"io/ioutil"
 	"log"
 	"net/http"
 
@@ -15,6 +16,7 @@ import (
 	storage "google.golang.org/api/storage/v1"
 
 	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
 	"golang.org/x/oauth2/jwt"
 )
 
@@ -28,13 +30,17 @@ type EventFromDb struct {
 	Loc         string `json:"loc"`  // Event location
 }
 
-func ExampleService_Calendar(calendarId string, events []*EventFromDb, oauthClient *http.Client) error {
+func ExampleService_calendar() {
+	var calendarId string = "xxxxxxxxxxxxx@group.calendar.google.com"
+	var events []*EventFromDb = getEventData()
+	var oauthClient *http.Client = getOauthClient()
 	// Read through slice of EventFromDb and add to batch.  Then call Do() to send
 	// and process responses
 	bsv := batch.Service{Client: oauthClient}
 	calsv, _ := cal.New(batch.BatchClient)
 
 	for _, ev := range events {
+		// create Event
 		event := &cal.Event{
 			Summary:            ev.Title,
 			Description:        ev.Description,
@@ -46,17 +52,24 @@ func ExampleService_Calendar(calendarId string, events []*EventFromDb, oauthClie
 			Source:             &cal.EventSource{Title: "Web Link", Url: ev.Link},
 			ExtendedProperties: &cal.EventExtendedProperties{Shared: map[string]string{"DBID": ev.Id}},
 		}
+
 		event, err := calsv.Events.Insert(calendarId, event).Do()
-		if err = bsv.AddRequest(err, batch.SetResult(&event), batch.SetTag(ev)); err != nil {
+		// queue new request in batch service
+		err = bsv.AddRequest(err,
+			batch.SetResult(&event),
+			batch.SetTag(ev),
+		)
+		if err != nil {
 			log.Println(err)
-			return err
+			return
 		}
 	}
 
+	// execute batch
 	responses, err := bsv.Do()
 	if err != nil {
 		log.Println(err)
-		return err
+		return
 	}
 	for _, r := range responses {
 		var event *cal.Event
@@ -66,17 +79,27 @@ func ExampleService_Calendar(calendarId string, events []*EventFromDb, oauthClie
 			continue
 		}
 		event = r.Result.(*cal.Event)
-		updateDatabaseorSomethingElse(tag, event.Id)
+		updateDatabaseorSomething(tag, event.Id)
 	}
-	return nil
+	return
 }
 
-func updateDatabaseorSomethingElse(ev *EventFromDb, newCalEventId string) {
+func updateDatabaseorSomething(ev *EventFromDb, newCalEventId string) {
 	// Logic for database update or post processing
 	return
 }
 
-func ExampleService_UserData(projectId string, usernames []string, config *jwt.Config) error {
+func getEventData() []*EventFromDb {
+	// do something to retrieve data from a database
+	return nil
+}
+
+func getOauthClient() *http.Client {
+	return nil
+}
+
+func ExampleService_userdata() {
+	projectId, usernames, config := getInitialData()
 	// Retrieve the list of available buckets for each user for a given api project as well as
 	// profile info for each person
 	bsv := batch.Service{} // no need for client as individual requests will have their own authorization
@@ -97,7 +120,7 @@ func ExampleService_UserData(projectId string, usernames []string, config *jwt.C
 			batch.SetTag([]string{u, "Buckets"}),
 			batch.SetCredentials(cred)); err != nil {
 			log.Printf("Error adding bucklist request for %s: %v", u, err)
-			return err
+			return
 		}
 
 		// create profile request
@@ -107,14 +130,15 @@ func ExampleService_UserData(projectId string, usernames []string, config *jwt.C
 			batch.SetTag([]string{u, "Profile"}),
 			batch.SetCredentials(cred)); err != nil {
 			log.Printf("Error adding profile request for %s: %v", u, err)
-			return err
+			return
 		}
 	}
 
+	// execute batch
 	responses, err := bsv.Do()
 	if err != nil {
 		log.Println(err)
-		return err
+		return
 	}
 	// process responses
 	for _, r := range responses {
@@ -134,5 +158,12 @@ func ExampleService_UserData(projectId string, usernames []string, config *jwt.C
 			}
 		}
 	}
-	return nil
+	return
+}
+
+func getInitialData() (string, []string, *jwt.Config) {
+	jwtbytes, _ := ioutil.ReadFile("secret.json")
+
+	config, _ := google.JWTConfigFromJSON(oauth2.NoContext, jwtbytes)
+	return "XXXXXXXXXXXXXXXX", []string{"jcote", "bclinton", "gbush", "bobama"}, config
 }
