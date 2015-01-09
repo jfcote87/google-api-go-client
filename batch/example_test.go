@@ -28,7 +28,7 @@ type EventFromDb struct {
 	Loc         string `json:"loc"`  // Event location
 }
 
-func Example_CalendarInsert(calendarId string, events []*EventFromDb, oauthClient *http.Client) error {
+func ExampleService_Calendar(calendarId string, events []*EventFromDb, oauthClient *http.Client) error {
 	// Read through slice of EventFromDb and add to batch.  Then call Do() to send
 	// and process responses
 	bsv := batch.Service{Client: oauthClient}
@@ -76,7 +76,7 @@ func updateDatabaseorSomethingElse(ev *EventFromDb, newCalEventId string) {
 	return
 }
 
-func Example_ListUserBucketsMessages(projectId string, usernames []string, config *jwt.Config) error {
+func ExampleService_UserData(projectId string, usernames []string, config *jwt.Config) error {
 	// Retrieve the list of available buckets for each user for a given api project as well as
 	// profile info for each person
 	bsv := batch.Service{} // no need for client as individual requests will have their own authorization
@@ -125,7 +125,7 @@ func Example_ListUserBucketsMessages(projectId string, usernames []string, confi
 		}
 		if tag[1] == "Profile" {
 			profile := r.Result.(*gmail.Profile)
-			log.Printf("User %s profile id is %s", profile.EmailAddress, profile.HistoryId)
+			log.Printf("User %s profile id is %d", profile.EmailAddress, profile.HistoryId)
 		} else {
 			blist := r.Result.(*storage.Buckets)
 			log.Printf("User: %s", tag[0])
