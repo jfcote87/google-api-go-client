@@ -278,7 +278,7 @@ func TestAddRequest(t *testing.T) {
 	err = sv.AddRequest(d, SetTag("2nd Request"))
 	err = sv.AddRequest(d, SetTag("3rd Request"))
 	if len(sv.requests) != 3 {
-		t.Errorf("AddRequest count should be 3 instead is %", len(sv.requests))
+		t.Errorf("AddRequest count should be 3 instead is %d", len(sv.requests))
 		return
 	}
 
@@ -295,7 +295,7 @@ func TestAddRequest(t *testing.T) {
 
 			log.Printf("Request %d: %v\n", i, rx.tag)
 		}
-		t.Errorf("AddRequest count should be 1 instead is %", len(sv.requests))
+		t.Errorf("AddRequest count should be 1 instead is %d", len(sv.requests))
 	}
 	//b = &request
 
