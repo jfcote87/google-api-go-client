@@ -174,10 +174,12 @@ type Service struct {
 	// Is set to http.DefaultClient if nil.  An oauth2.Client may be used
 	// to authorize the requests or each individual request may have its
 	// own credential removing the need for an authorizing client.
-	Client       *http.Client
-	MaxRequests  int
-	requests     []*Request
+	Client      *http.Client
+	MaxRequests int
+
+	// mu protectes the requests slice
 	mu           sync.Mutex
+	requests     []*Request
 	initBuffSize int
 }
 
