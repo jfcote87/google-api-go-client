@@ -5,17 +5,18 @@
 package batch_test
 
 import (
-	"github.com/jfcote87/google-api-go-client/batch"
-	"github.com/jfcote87/google-api-go-client/batch/credentials"
+	"context"
 	"io/ioutil"
 	"log"
 	"net/http"
+
+	"github.com/jfcote87/google-api-go-client/batch"
+	"github.com/jfcote87/google-api-go-client/batch/credentials"
 
 	cal "google.golang.org/api/calendar/v3"
 	gmail "google.golang.org/api/gmail/v1"
 	storage "google.golang.org/api/storage/v1"
 
-	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	"golang.org/x/oauth2/jwt"
 )
@@ -31,6 +32,7 @@ type EventFromDb struct {
 }
 
 func ExampleService_calendar() {
+	var ctx context.Context = context.Background()
 	var calendarId string = "xxxxxxxxxxxxx@group.calendar.google.com"
 	var events []*EventFromDb = getEventData()
 	var oauthClient *http.Client = getOauthClient()
@@ -66,7 +68,7 @@ func ExampleService_calendar() {
 	}
 
 	// execute batch
-	responses, err := bsv.Do()
+	responses, err := bsv.DoCtx(ctx)
 	if err != nil {
 		log.Println(err)
 		return
@@ -99,19 +101,20 @@ func getOauthClient() *http.Client {
 }
 
 func ExampleService_userdata() {
+	var ctx context.Context = context.Background()
 	projectId, usernames, config := getInitialData()
 	// Retrieve the list of available buckets for each user for a given api project as well as
 	// profile info for each person
 	bsv := batch.Service{} // no need for client as individual requests will have their own authorization
 	storagesv, _ := storage.New(batch.BatchClient)
 	gsv, _ := gmail.New(batch.BatchClient)
-	config.Scopes = []string{gmail.MailGoogleComScope, "email", storage.DevstorageRead_onlyScope}
+	config.Scopes = []string{gmail.MailGoogleComScope, "email", storage.DevstorageReadOnlyScope}
 
 	for _, u := range usernames {
 		// create new credentials for specific user
 		tConfig := *config
 		tConfig.Subject = u + "@example.com"
-		cred := &credentials.Oauth2Credentials{TokenSource: tConfig.TokenSource(oauth2.NoContext)}
+		cred := &credentials.Oauth2Credentials{TokenSource: tConfig.TokenSource(context.Background())}
 
 		// create bucket list request
 		bucketList, err := storagesv.Buckets.List(projectId).Do()
@@ -135,7 +138,7 @@ func ExampleService_userdata() {
 	}
 
 	// execute batch
-	responses, err := bsv.Do()
+	responses, err := bsv.DoCtx(ctx)
 	if err != nil {
 		log.Println(err)
 		return
@@ -161,9 +164,9 @@ func ExampleService_userdata() {
 	return
 }
 
-func getInitialData() (string, []string, *jwt.Config) {
+func getInitialData(scopes ...string) (string, []string, *jwt.Config) {
 	jwtbytes, _ := ioutil.ReadFile("secret.json")
 
-	config, _ := google.JWTConfigFromJSON(oauth2.NoContext, jwtbytes)
+	config, _ := google.JWTConfigFromJSON(jwtbytes, scopes...)
 	return "XXXXXXXXXXXXXXXX", []string{"jcote", "bclinton", "gbush", "bobama"}, config
 }

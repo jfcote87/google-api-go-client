@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// Batch implements a service to use the google client api
+// Package batch implements a service to use the google client api
 // batch protocol.  For specifics of the batch protocol see
 // https://cloud.google.com/storage/docs/json_api/v1/how-tos/batch
 package batch
@@ -11,10 +11,10 @@ package batch
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"google.golang.org/api/googleapi"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -25,6 +25,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"golang.org/x/net/context/ctxhttp"
+
+	"io/ioutil"
+
+	"google.golang.org/api/googleapi"
 )
 
 const baseURL = "https://www.googleapis.com/batch"
@@ -42,17 +48,17 @@ var skipHeaders = map[string]bool{
 	"User-Agent": true,
 }
 
-var logFlag bool = false
+var logFlag bool
 
 // Error used when looping through individual responses
 func batchError(r *Request, e error) error {
 	return fmt.Errorf("BatchApi: Request Write Error: (%v) %s", r.tag, e.Error())
 }
 
-// TODO: this is a placeholder until new oauth2 library is completed
+// Credentialer provides oauth credentials to a request
 type Credentialer interface {
 	Authorization() (string, error)
-	SetAuthHeader(*http.Request) error
+	//SetAuthHeader(*http.Request) error
 }
 
 // requestData stores header, url and body information for a Request.  It implements
@@ -71,7 +77,7 @@ func (d *requestData) Error() string {
 
 // BatchClient is used to initiate a client api service.  All client api
 // requests return a batchData struct.
-var BatchClient *http.Client = &http.Client{Transport: &batchIntercept{}}
+var BatchClient = &http.Client{Transport: &batchIntercept{}}
 
 type batchIntercept struct{}
 
@@ -79,8 +85,12 @@ type batchIntercept struct{}
 // for later processing.
 func (bt *batchIntercept) RoundTrip(req *http.Request) (*http.Response, error) {
 	// check for media upload as a batch request cannot contain a media upload
-	if strings.HasSuffix(req.URL.Path, "/upload") {
+	if strings.HasPrefix(req.URL.Path, "/upload") {
 		return nil, errors.New("BatchApi: Media Uploads not allowed for a BatchItem")
+	}
+
+	if s := req.Header.Get("Content-Type"); s != "" && s != "application/json" {
+		return nil, fmt.Errorf("BatchApi: Expected application/json content; got %s", s)
 	}
 
 	// create new requestData to return in err
@@ -93,15 +103,13 @@ func (bt *batchIntercept) RoundTrip(req *http.Request) (*http.Response, error) {
 			d.header[k] = s
 		}
 	}
-
-	// copy body into []byte so we don't have an open reader
+	// add body if available
 	if req.Body != nil {
 		defer req.Body.Close()
-		b := bytes.NewBuffer(make([]byte, 0, int(req.ContentLength)))
-		if _, err := io.Copy(b, req.Body); err != nil {
+		d.body = make([]byte, req.ContentLength, req.ContentLength)
+		if _, err := req.Body.Read(d.body); err != nil {
 			return nil, err
 		}
-		d.body = b.Bytes()
 	}
 	return nil, d
 }
@@ -122,51 +130,23 @@ type Request struct {
 	//batch.Service credential
 }
 
-// processResponse reads json bytes from io.Reader and updates Response values
-func (r *Request) processResponse(rd io.Reader, res *Response) {
-	res.Err = nil // reset just in case of reuse
-	defer func() {
-		if p := recover(); p != nil {
-			e, ok := p.(error)
-			if !ok {
-				e = fmt.Errorf("BatchItem process response Unknown panic %v", e)
-			}
-			res.Err = e
-		}
-		if res.Err != nil {
-			r.status = requestStatusError
-		}
-	}()
-
-	// decode json if call requires
-	if r.resultPtr != nil {
-		// Set result to a nil pointer to prevent casting errors on return
-		res.Result = reflect.ValueOf(r.resultPtr).Elem().Interface()
-		if rd != nil {
-			if err := json.NewDecoder(rd).Decode(r.resultPtr); err != nil {
-				res.Err = err
-				return
-			}
-		} else {
-			res.Err = errors.New("No JSON data returned")
-			return
-		}
-		//JSON Decode successful
-		res.Result = reflect.ValueOf(r.resultPtr).Elem().Interface()
-	}
-	r.status = requestStatusSuccess
-	return
+// String returns a string representation of the Request's tag.  Used for debugging
+func (r *Request) String() string {
+	return fmt.Sprintf("%v", r.tag)
 }
 
 // Response returns results of Request Call
 type Response struct {
-	// Result is the value of the json decode response
+	// Result is the value of the decoded json
 	Result interface{}
 	// Tag is copied from corresponding Request.tag and is used to pass data
 	// for further processing of the result.
 	Tag interface{}
-	// Err is the error result from a Request
+	// Err contains error response
 	Err error
+	// ServerResponse contains the HTTP response code and headers from the
+	// server.
+	googleapi.ServerResponse
 }
 
 // Service for submitting batch
@@ -176,7 +156,9 @@ type Service struct {
 	// own credential removing the need for an authorizing client.
 	Client      *http.Client
 	MaxRequests int
-
+	// if not nil, DoCtx() calls this during the request and response
+	// assigning the []byte variable to the request or response body.
+	DebugFunc func(string, []byte)
 	// mu protectes the requests slice
 	mu           sync.Mutex
 	requests     []*Request
@@ -194,7 +176,7 @@ type Service struct {
 //	  // handle error
 // }
 func (s *Service) AddRequest(e error, opts ...RequestOption) (err error) {
-	var r *Request = &Request{}
+	var r = &Request{}
 	if e == nil {
 		return errors.New("BatchApi: Request was Called not Batched.  Service transport was not set to batch.Client()")
 	}
@@ -220,13 +202,6 @@ func (s *Service) AddRequest(e error, opts ...RequestOption) (err error) {
 	s.mu.Lock()
 	defer func() {
 		s.mu.Unlock()
-		if p := recover(); p != nil {
-			err, ok := p.(error)
-			if !ok {
-				err = fmt.Errorf("BatchItem process response Unknown panic %v", err)
-			}
-			return
-		}
 	}()
 
 	s.requests = append(s.requests, r)
@@ -241,9 +216,19 @@ func (s *Service) Count() int {
 	return len(s.requests)
 }
 
+// RequestList returns the current list of requests
+func (s *Service) RequestList() []*Request {
+	return s.requests
+}
+
 // Do sends up to maxRequests(default 1000) in a single request.  Remaining requests
 // still stored for later calls
 func (s *Service) Do() ([]Response, error) {
+	return s.DoCtx(context.Background())
+}
+
+// DoCtx adds a context to the call
+func (s *Service) DoCtx(ctx context.Context) ([]Response, error) {
 	if len(s.requests) == 0 {
 		return nil, errors.New("BatchApi: No requests queued")
 	}
@@ -270,9 +255,8 @@ func (s *Service) Do() ([]Response, error) {
 	}
 
 	if reqLen > maxRequests {
-		s.requests = make([]*Request, (reqLen - maxRequests), maxRequests)
-		copy(s.requests, requests[maxRequests:])
-		requests = requests[:maxRequests]
+		s.requests = s.requests[maxRequests:]
+		requests = requests[:maxRequests-1]
 	} else {
 		s.requests = make([]*Request, 0, maxRequests)
 	}
@@ -282,7 +266,6 @@ func (s *Service) Do() ([]Response, error) {
 	outputBuf := bytes.NewBuffer(make([]byte, 0, s.initBuffSize))
 	batchWriter := multipart.NewWriter(outputBuf)
 	boundary := "multipart/mixed; boundary=\"" + batchWriter.Boundary() + "\""
-
 	for cnt, r := range requests {
 		pdata := r.data
 		m := textproto.MIMEHeader{
@@ -320,6 +303,10 @@ func (s *Service) Do() ([]Response, error) {
 	}
 	batchWriter.Close()
 
+	if s.DebugFunc != nil {
+		s.DebugFunc("Request", outputBuf.Bytes())
+	}
+
 	// Create req to send batches
 	req, err := http.NewRequest("POST", baseURL, outputBuf)
 	if err != nil {
@@ -329,7 +316,7 @@ func (s *Service) Do() ([]Response, error) {
 	req.Header.Set("Content-Type", boundary)
 	req.Header.Set("User-Agent", "google-api-go-batch 0.1")
 
-	resp, err := client.Do(req)
+	resp, err := ctxhttp.Do(ctx, client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -344,70 +331,106 @@ func (s *Service) Do() ([]Response, error) {
 	if !strings.HasPrefix(cType, "multipart/") {
 		return nil, fmt.Errorf("BatchApi: Invalid Content Type returned %s", cType)
 	}
-
-	return processBody(resp.Body, params["boundary"], requests)
+	var body io.Reader = resp.Body
+	if s.DebugFunc != nil {
+		debugBuffer, err := ioutil.ReadAll(body)
+		if err != nil {
+			return nil, err
+		}
+		s.DebugFunc("Response", debugBuffer)
+		body = bytes.NewReader(debugBuffer)
+	}
+	return ProcessBody(ctx, resp.Body, params["boundary"], requests)
 }
 
-// processBody loops through requests and processes each part of multipart response
-func processBody(rc io.ReadCloser, boundary string, requests []*Request) (results []Response, err error) {
-	results = make([]Response, len(requests), len(requests))
+// ProcessBody loops through requests and processes each part of multipart response
+func ProcessBody(ctx context.Context, rc io.Reader, boundary string, requests []*Request) (results []Response, err error) {
+	results = make([]Response, 0, len(requests))
 	mr := multipart.NewReader(rc, boundary)
-	itemCnt := 0
-	defer func() {
-		rc.Close()
-		if r := recover(); r != nil {
-			err = fmt.Errorf("BatchApi: processBody %d %v", itemCnt, r)
-		}
-	}()
 
 	// Http response from batch Do is supposed to be in the same order as results.
 	for idx, req := range requests {
-		var res *http.Response
-		curResult := &results[idx]
-		curResult.Tag = req.tag
-		itemCnt = idx
+		// Check ct
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
 		pr, err := mr.NextPart()
-
 		if err != nil {
-			goto BODYERROR
+			return nil, fmt.Errorf("Unable to parse multipart response(%d): %v", idx, err)
 		}
-
-		if pr.Header.Get("Content-Type") != "application/http" {
-			err = fmt.Errorf("Batch Api: Invalid Content Type: %s", pr.Header.Get("Content-Type"))
-			goto BODYERROR
-		}
-		res, err = http.ReadResponse(bufio.NewReader(pr), nil)
-		if err != nil {
-			goto BODYERROR
-		}
-		if err = googleapi.CheckResponse(res); err != nil {
-			goto BODYERROR
-		}
-
-		if res.ContentLength > 0 && strings.HasPrefix(res.Header.Get("Content-Type"), "application/json") {
-			req.processResponse(res.Body, curResult)
-
-		} else {
-			req.processResponse(nil, curResult)
-		}
-
-		res.Body.Close()
-		continue
-
-	BODYERROR:
-		curResult.Err = err
+		results = append(results, parseMimePart(pr, req))
 	}
-	rc.Close()
 	return
 }
 
+// parseMimePart returns a Response from a mimepart.  See documentation at
+// https://cloud.google.com/storage/docs/json_api/v1/how-tos/batch#response-to-a-batch-request
+func parseMimePart(pr *multipart.Part, rq *Request) Response {
+	defer pr.Close()
+	var err error
+	var res *http.Response
+
+	if pr.Header.Get("Content-Type") != "application/http" {
+		err = fmt.Errorf("Batch Api: Invalid Content Type: %s", pr.Header.Get("Content-Type"))
+	} else if res, err = http.ReadResponse(bufio.NewReader(pr), nil); err == nil {
+		defer res.Body.Close()
+		err = googleapi.CheckResponse(res)
+	}
+	if err != nil {
+		return ErrorResponse(rq, err)
+	}
+	result := NewResponse(res.Body, rq)
+	result.ServerResponse =
+		googleapi.ServerResponse{
+			HTTPStatusCode: res.StatusCode,
+			Header:         res.Header,
+		}
+	return result
+}
+
+// ErrorResponse creates a response with the passed error
+func ErrorResponse(rq *Request, err error) Response {
+	var ix interface{}
+	if rq.resultPtr != nil {
+		// Set result to a nil pointer to prevent casting errors on return
+		ix = reflect.ValueOf(rq.resultPtr).Elem().Interface()
+	}
+	return Response{Result: ix, Err: err, Tag: rq.tag}
+}
+
+// NewResponse creates a response from a stream
+func NewResponse(r io.Reader, rq *Request) Response {
+	var ix interface{}
+	var err error
+	if rq.resultPtr != nil {
+		// Set result to a nil pointer to prevent casting errors on return
+		ix = reflect.ValueOf(rq.resultPtr).Elem().Interface()
+		if r != nil {
+			err = json.NewDecoder(r).Decode(rq.resultPtr)
+		} else {
+			err = errors.New("No JSON data returned")
+		}
+		//JSON Decode successful
+		ix = reflect.ValueOf(rq.resultPtr).Elem().Interface()
+	}
+	return Response{
+		Result: ix,
+		Err:    err,
+		Tag:    rq.tag,
+	}
+}
+
+// RequestOption configurs
 type RequestOption func(*Request) error
 
-// Set resultPtr so that batch.Request can unmarshall JSON response.
+// SetResult provides a struct pointer so that batch.Request may unmarshall
+// corresponding JSON response. Teh easiest way is to
 // This should be set to the address of the value returned in the client api
 // Do() call.  Not needed if client api call returns only an error
 //
-// ret, err = svCal.Events.Insert(*cal, eventData).Do()
+// ret, err := svCal.Events.Insert(*cal, eventData).Do()
 // if err = batchService.AddItem(err, batch.SetResult(&ret)); err != nil {
 //	  // handle error
 // }
@@ -417,7 +440,6 @@ func SetResult(resultPtr interface{}) RequestOption {
 			v := reflect.ValueOf(resultPtr)
 			//Insist that ret is a ptr to ptr for json decoding
 			if v.Kind() != reflect.Ptr || v.Elem().Kind() != reflect.Ptr {
-
 				return errors.New("BatchApi: Invalid Result Pointer Value.  Must be a  **struct")
 			}
 		}
@@ -436,7 +458,7 @@ func SetTag(tag interface{}) RequestOption {
 	}
 }
 
-// SetToken overrides the batch.Service authorization.  This allows for multiple
+// SetCredentials overrides the batch.Service authorization.  This allows for multiple
 // credential to be used in a single batch call.  Not needed if the request
 // uses authorization from batch.Service
 func SetCredentials(cred Credentialer) RequestOption {

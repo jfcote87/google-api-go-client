@@ -2,25 +2,32 @@
 // All rights reserved.
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
-package batch
+package batch_test
 
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
-	"google.golang.org/api/googleapi"
 	"io"
-	"log"
 	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/jfcote87/google-api-go-client/batch"
+
+	"io/ioutil"
+
+	"net/http/httptest"
+
+	"google.golang.org/api/googleapi"
 )
 
-var testResponse string = `HTTP/1.1 200 OK
+var testResponse = `HTTP/1.1 200 OK
 Content-Type: multipart/mixed; boundary=batchXpK7JBAk73XEXXAA5eFwv4m2QX
 Date: Tue, 22 Jan 2013 18:56:00 GMT
 Expires: Tue, 22 Jan 2013 18:56:00 GMT
@@ -79,17 +86,9 @@ Expires: Tue, 22 Jan 2013 18:56:00 GMT
 --batchXpK7JBAk73XEXXAA5eFwv4m2QX--
 `
 
-type Tstr struct {
+type TestStruct struct {
 	A string
 	B int
-}
-
-type testError struct {
-	E error
-}
-
-func (e testError) Error() string {
-	return e.E.Error()
 }
 
 type ObjectAccessControl struct {
@@ -109,51 +108,43 @@ type ObjectAccessControl struct {
 }
 
 //  JSON Response Tests
-func TestJSONParse(t *testing.T) {
-	log.SetOutput(os.Stdout)
-
+func TestResponseParse(t *testing.T) {
 	// Sanity check: pass in **ptr and receive *ptr
-	res := &Response{}
-	req := &Request{}
+	var res batch.Response
+	req := &batch.Request{}
 	var rd io.Reader
 	//Zero Request should create a blank response
-	req.processResponse(rd, res)
+	res = batch.NewResponse(rd, req)
 	if res.Err != nil {
-		log.Fatalf("Zero Request Err: %v", res.Err)
+		t.Errorf("Expected no error on empty reader; got: %v", res.Err)
 	}
 	// nil reader with resultPtr should provide error "No JSon data returned"
 	// and set result to a nil valued ptr of proper type
-	var xptr *Tstr
-	req.resultPtr = &xptr
-	req.processResponse(rd, res)
-	if t, ok := res.Result.(*Tstr); !ok || t != nil {
-		log.Fatalf("Nil Reader with result should return nil value ptr of %v", reflect.ValueOf(xptr).Type())
+	var testPtr *TestStruct
+	batch.SetResult(&testPtr)(req)
+	res = batch.NewResponse(rd, req)
+	if tval, ok := res.Result.(*TestStruct); !ok || tval != nil {
+		t.Errorf("Wanted nil ptr value when response bytes are empty; got %v", reflect.ValueOf(testPtr).Type())
 	}
 	if res.Err == nil || res.Err.Error() != "No JSON data returned" {
-		log.Fatalf("Nil Reader with result should return error of No Json data returned")
+		t.Errorf("Wanted \"No JSON data returned\" on empty response; got %v", res.Err)
 	}
 
 	// reader with json error
-	buf := bytes.NewBufferString("{ \"A\": 5, \"B\":\"Teststring\"}")
-	req.processResponse(buf, res)
+	buf := bytes.NewBufferString("{ \"A\": 5, \"B\":\"TesTestStructing\"}")
+	res = batch.NewResponse(rd, req)
 	if res.Err == nil {
-		log.Fatalf("Reader with json error should return error ")
+		t.Errorf("Wanted invalid json error; got nil")
 	}
 
-	// good reader should return nil Err and a Result of *Tstr
-	res.Err = nil
-	res.Result = nil
-	buf = bytes.NewBufferString("{ \"B\": 5, \"A\":\"Teststring\"}")
-	req.processResponse(buf, res)
+	// good reader should return nil Err and a Result of *TestStruct
+	buf = bytes.NewBufferString("{ \"B\": 5, \"A\":\"TesTestStructing\"}")
+	res = batch.NewResponse(buf, req)
 	if res.Err != nil {
-		log.Fatalf("Good Read Error: %v", res.Err)
+		t.Fatalf("Wanted no error; got: %v", res.Err)
 	}
-	if t, ok := res.Result.(*Tstr); !ok {
-		log.Fatalf("Good Read should return *Tstr instead is %v", reflect.ValueOf(reflect.ValueOf(res.Result).Type()))
-	} else {
-		if t.B != 5 && t.A != "Teststring" {
-			log.Fatalf("Good Read Invalid Values %d %s", t.B, t.A)
-		}
+	if tval, ok := res.Result.(*TestStruct); !ok || tval == nil || tval.B != 5 || tval.A != "TesTestStructing" {
+		t.Errorf(`Wanted TestStruct{A: "TesTestStructing", B: 5}; got %#v`, tval)
 	}
 }
 
@@ -162,123 +153,124 @@ func TestBodyProcess(t *testing.T) {
 	tb := bytes.NewBuffer([]byte(strings.Replace(testResponse, "\n", "\r\n", -1)))
 	res, err := http.ReadResponse(bufio.NewReader(tb), nil)
 	if err != nil {
-		t.Fatalf("RESPONSE load: %v", err)
-		return
+		t.Fatalf("Wanted test response to create http.Response; got %v", err)
 	}
 
 	var t1 *ObjectAccessControl
 	var t2 *ObjectAccessControl
 	var t3 *ObjectAccessControl
 
-	rq := make([]*Request, 4)
-	rq[0] = &Request{resultPtr: &t1, tag: "T1"}
-	rq[1] = &Request{resultPtr: &t2, tag: "T2"}
-	rq[2] = &Request{resultPtr: &t3, tag: "T3"}
-	rq[3] = &Request{tag: "T4"}
+	rq := make([]*batch.Request, 4)
+	rq[0] = &batch.Request{}
+	rq[1] = &batch.Request{}
+	rq[2] = &batch.Request{}
+	rq[3] = &batch.Request{}
+	batch.SetResult(&t1)(rq[0])
+	batch.SetTag("T1")(rq[0])
+	batch.SetResult(&t2)(rq[1])
+	batch.SetTag("T2")(rq[1])
+	batch.SetResult(&t3)(rq[2])
+	batch.SetTag("T3")(rq[2])
+	batch.SetTag("T4")(rq[3])
 
 	cType, params, err := mime.ParseMediaType(res.Header.Get("Content-Type"))
 	if err != nil {
-		t.Errorf(("Batch Api: %v\n"), err)
-		return
+		t.Fatalf(("Wanted testResponse to parse correctly; got %v"), err)
 	}
 	if !strings.HasPrefix(cType, "multipart/") {
-		t.Errorf("BatchApi: Invalid Content Type returned %s", cType)
+		t.Errorf("Wanted ParseMediaType to return multipart type; got %s", cType)
 		return
 	}
 	_ = params
 
-	results, err := processBody(res.Body, params["boundary"], rq)
-	if err != nil {
-		t.Fatalf("Process Body Error: %v", err)
-		return
-	}
-
-	if len(results) != len(rq) {
-		t.Fatalf("Process Body Error: Number of results %d should equal number of requests %d", len(results), len(rq))
+	results, err := batch.ProcessBody(context.Background(), res.Body, params["boundary"], rq)
+	if err != nil || len(results) != len(rq) {
+		t.Fatalf("Wanted ProcessBody to return %d results; got %d results with error %v", len(rq), len(results), err)
 	}
 
 	rx := results[0]
-	if rx.Err == nil {
-		t.Logf("Tag %s  Err %v", rx.Tag.(string), rx.Err)
-		t.Error("First Batch Item should return a googleapi error")
-	} else {
-		if e, ok := rx.Err.(*googleapi.Error); !ok {
-			t.Errorf("First Batch Item should return google api error:  received %v\n", e)
-		}
-		if strData, ok := rx.Tag.(string); !ok || strData != "T1" {
-			t.Errorf("First Batch Item should have T1 as data: %v\n", rx.Tag)
-		}
+	if _, ok := rx.Err.(*googleapi.Error); !ok {
+		t.Errorf("Wanted first batch item to return google api error; go %#v", err)
+	}
+	if strData, ok := rx.Tag.(string); !ok || strData != "T1" {
+		t.Errorf("Wanted first batch item tagged as \"T1\"; got %v", rx.Tag)
 	}
 
 	rx = results[1]
-	//if rx.Err != nil || rx.Result == nil || rx.Result.(*ObjectAccessControl).Object != "obj2" {
 	if rx.Err == nil || !strings.HasPrefix(rx.Err.Error(), "invalid character 'i'") {
-		t.Errorf("2nd Batch Item should have json error: %v\n", rx.Err)
+		t.Errorf("Wanted 2nd batch item to return json parse error; got %v", rx.Err)
 	}
-
 	if strData, ok := rx.Tag.(string); !ok || strData != "T2" {
-		t.Errorf("2nd Batch Item should have T2 as data: %v\n", rx.Tag)
+		t.Errorf("Wanted 2nd batch item tagged as \"T2\"; got %v", rx.Tag)
 	}
 
 	rx = results[2]
 	if rx.Err != nil || rx.Result == nil || rx.Result.(*ObjectAccessControl).Object != "obj3" {
-		t.Errorf("3rd Batch Item should be error free and return object obj3: %v\n", rx.Err)
+		t.Errorf("Wanted 3rd batch to return ObjectAccessControl struct; got %#v %v", rx.Result, rx.Err)
 	}
 	if strData, ok := rx.Tag.(string); !ok || strData != "T3" {
-		t.Errorf("3rd Batch Item should have T3 as data: %v\n", rx.Tag)
+		t.Errorf("Wanted 3rd batch item tagged as \"T3\"; got %v", rx.Tag)
 	}
 
 	rx = results[3]
 	if rx.Err != nil || rx.Result != nil {
-		t.Errorf("4th Batch Item should have no error and return nil: %v  %v\n", rx.Err, rx.Result)
+		t.Errorf("Wanted 4th batch item to return nil ptr and nil error; got %v  %v", rx.Result, rx.Err)
 	}
 	if strData, ok := rx.Tag.(string); !ok || strData != "T4" {
-		t.Errorf("4th Batch Item should have T4 as data: %v\n", rx.Tag)
+		t.Errorf("Wanted 4th batch item tagged as \"T4\"; got %v", rx.Tag)
 	}
-
 	return
 }
 
 func TestAddRequest(t *testing.T) {
 	err := fmt.Errorf("This is not a batch.Request")
-	sv := &Service{}
+	sv := &batch.Service{}
 	if err = sv.AddRequest(err); err == nil {
-		t.Errorf("Add Request should have failed with a non batch.Request error")
+		t.Errorf("Wanted AddRequest to fail; got %v", err)
 	}
 
-	d := &requestData{}
-	b := &Request{data: d}
-	var tx *Tstr
-	if err = SetResult(tx)(b); err == nil {
-		t.Errorf("Set result to a *ptr should error.  Need a **ptr")
+	b := &batch.Request{}
+	var tx *TestStruct
+	if err = batch.SetResult(tx)(b); err == nil {
+		t.Errorf("Wanted error Invalid Result Pointer Value; got nil error")
 	}
-	if err = SetResult(&tx)(b); err != nil {
-		t.Errorf("SetResult Fail: %v", err)
+	batch.SetTag("TAG")(b)
+	if err = batch.SetResult(&tx)(b); err != nil {
+		t.Errorf("Wanted good SetResult; got %v", err)
 	} else {
-		if testPtr, ok := b.resultPtr.(**Tstr); !ok || testPtr != &tx {
-			t.Errorf("SetResult Fail: Pointer not initialized properly")
+		newResp := batch.NewResponse(nil, b)
+		if testPtr, ok := newResp.Result.(*TestStruct); !ok || testPtr != tx {
+			t.Errorf("Wantd %#v; got %#v", tx, testPtr)
+		}
+		newResp = batch.NewResponse(bytes.NewBufferString("{\"A\":\"A\",\"B\":9}"), b)
+		if testPtr, ok := newResp.Result.(*TestStruct); !ok || testPtr == nil || testPtr.A != "A" || testPtr.B != 9 {
+			t.Errorf("SetResult: Expected testPtr to equal {A:\"A\", B:9}; got %#v", testPtr)
 		}
 	}
-	//t.Errorf("%v", err)
 	sv.Client = &http.Client{Transport: &TestTransport{}}
 	sv.MaxRequests = 2
 
-	d.method = "GET"
-	d.uri = "/example/uri"
-	d.header = make(http.Header)
-	d.header.Set("A", "B")
-	d.header.Set("D", "F")
-	d.body = []byte("THIS IS A BODY")
-	b.status = requestStatusQueued
-
-	err = sv.AddRequest(d, SetResult(&tx), SetTag("1st Request"))
-	if err != nil {
-		t.Errorf("AddRequst Failed: %v", err)
+	req, _ := http.NewRequest("POST", "http://example.com/upload/example/uri", bytes.NewBuffer([]byte("PAYLOAD")))
+	req.Header.Set("host", "testHost")
+	req.Header.Set("User-Agent", "TestUA")
+	_, d := batch.BatchClient.Do(req)
+	if d == nil || !strings.HasSuffix(d.Error(), "Media Uploads not allowed for a BatchItem") {
+		t.Errorf("Expected \"BatchApi: Media Uploads not allowed for a BatchItem\"; got %v", d)
 	}
-	err = sv.AddRequest(d, SetTag("2nd Request"))
-	err = sv.AddRequest(d, SetTag("3rd Request"))
-	if len(sv.requests) != 3 {
-		t.Errorf("AddRequest count should be 3 instead is %d", len(sv.requests))
+
+	req, _ = http.NewRequest("GET", "http://example.com/example/uri", bytes.NewBuffer([]byte("PAYLOAD")))
+	req.Header.Set("host", "testHost")
+	req.Header.Set("User-Agent", "TestUA")
+	_, d = batch.BatchClient.Do(req)
+	err = sv.AddRequest(d, batch.SetResult(&tx), batch.SetTag("1st Request"))
+	if err != nil {
+		t.Errorf("Wanted SetTag success; got %v", err)
+	}
+	err = sv.AddRequest(d, batch.SetTag("2nd Request"))
+	err = sv.AddRequest(d, batch.SetResult(&tx), batch.SetTag("3rd Request"), batch.SetCredentials(TestCredential{}))
+
+	if sv.Count() != 3 {
+		t.Errorf("Wanted count to be 3 instead; got %d", sv.Count())
 		return
 	}
 
@@ -286,19 +278,21 @@ func TestAddRequest(t *testing.T) {
 	// make certain we went thru ErrorTransport
 	err, ok := err.(*url.Error)
 	if !ok || err.(*url.Error).Err.Error() != "Test Transport" {
-		t.Errorf("AddRequest: TestTransport error %v", err)
+		t.Errorf("Wanted \"TestTransport error\"; got %v", err)
 	}
 
 	// Ensure that on MaxRequests were sent and that remaining were still stored
-	if len(sv.requests) != 1 {
-		for i, rx := range sv.requests {
-
-			log.Printf("Request %d: %v\n", i, rx.tag)
-		}
-		t.Errorf("AddRequest count should be 1 instead is %d", len(sv.requests))
+	if sv.Count() != 1 {
+		t.Errorf("Expected count to be 1; got %d", sv.Count())
 	}
-	//b = &request
-
+	sv.Client = &http.Client{Transport: &TestTransport2{}}
+	results, err := sv.Do()
+	if err != nil || len(results) != 1 {
+		t.Fatalf("Wanted 1 Response; got %d responses - %v", len(results), err)
+	}
+	if results[0].Tag != "3rd Request" || tx.A != "STRING" || tx.B != 9 {
+		t.Errorf("Wanted 3rd Response with value of {\"A\":\"STRING\", \"B\":9}; got %s - %v", results[0].Tag, tx)
+	}
 }
 
 type TestTransport struct{}
@@ -307,6 +301,62 @@ func (tr *TestTransport) RoundTrip(req *http.Request) (res *http.Response, err e
 	b := bytes.NewBuffer(make([]byte, 0, req.ContentLength))
 	io.Copy(b, req.Body)
 	req.Body.Close()
-	//log.Printf("%s\n", string(b.Bytes()))
 	return nil, fmt.Errorf("Test Transport")
+}
+
+type TestTransport2 struct{}
+
+func (tr *TestTransport2) RoundTrip(req *http.Request) (*http.Response, error) {
+	_, params, err := mime.ParseMediaType(req.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, err
+	}
+	defer req.Body.Close()
+	mr := multipart.NewReader(req.Body, params["boundary"])
+	pr, err := mr.NextPart()
+	if err != nil {
+		return nil, err
+	}
+	defer pr.Close()
+	if pr.Header.Get("Content-Id") != "batch0000" || pr.Header.Get("Content-Type") != "application/http" {
+		return nil, fmt.Errorf("Expected Content-Id = batch0000 and Content-Type = application/http; got %s, %s",
+			pr.Header.Get("Content-Id"), pr.Header.Get("Content-Type"))
+	}
+	rx, err := http.ReadRequest(bufio.NewReader(pr))
+	if err != nil {
+		return nil, err
+	}
+	defer rx.Body.Close()
+	if rx.Header.Get("Authorization") != "AuthString" {
+		return nil, fmt.Errorf("Expected Authorization header = AuthString; got %s", rx.Header.Get("Authorization"))
+	}
+	bx, err := ioutil.ReadAll(rx.Body)
+	if err != nil {
+		return nil, err
+	}
+	if string(bx) != "PAYLOAD" {
+		return nil, fmt.Errorf("Expected PAYLOAD; got %s", string(bx))
+	}
+	//return nil, errors.New("My Error")
+
+	rec := httptest.NewRecorder()
+	rec.Header().Set("Content-Type", "multipart/mixed; boundary=batchXpK7JBAk73XEXXAA5eFwv4m2QX")
+	rec.Header().Set("Date", "Tue, 22 Jan 2013 18:56:00 GMT")
+	rec.WriteString("--batchXpK7JBAk73XEXXAA5eFwv4m2QX\r\n")
+	rec.WriteString("Content-Type: application/http\r\n")
+	rec.WriteString("Content-ID: <response-8a09ca85-8d1d-4f45-9eb0-da8e8b07ec83+1>\r\n\r\n")
+	rec.WriteString("HTTP/1.1 200 OK\r\n")
+	rec.WriteString("Content-Type: application/json; charset=UTF-8\r\n")
+	rec.WriteString("Content-Length: 22\r\n\r\n{\"A\":\"STRING\",\"B\":9}\r\n")
+	rec.WriteString("--batchXpK7JBAk73XEXXAA5eFwv4m2QX--")
+
+	res := rec.Result()
+
+	return res, err
+}
+
+type TestCredential struct{}
+
+func (tc TestCredential) Authorization() (string, error) {
+	return "AuthString", nil
 }
